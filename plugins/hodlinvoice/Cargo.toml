@@ -12,6 +12,7 @@ anyhow = "1.0"
 log = "0.4"
 serde_json = "1.0.72"
 rand = "0.8.5"
+parking_lot = "0.12.1"
 bitcoin = "0.29.1"
 
 [dependencies.cln-plugin]
@@ -21,5 +22,5 @@ path = "../../plugins"
 path = "../../cln-rpc"
 
 [dependencies.tokio]
-features = ["net", "rt-multi-thread"]
+features = ["net", "rt-multi-thread","fs"]
 version = "1"

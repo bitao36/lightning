@@ -5,29 +5,23 @@
 #[macro_use]
 extern crate serde_json;
 
-use bitcoin::hashes::HashEngine;
-use bitcoin::hashes::Hash;
-use bitcoin::consensus::encode::serialize_hex;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use log::{debug, warn};
 
-use rand::Rng;
-use rand::thread_rng;
+mod config;
+mod model;
+
+use model::{Preimagestate,hodlmethod,settlemethod,cancelmethod,listdatastore, listinvoices,getkeyfromstore,getdeltamethod,PLUGIN_NAME,CLTV_HODL};
+use config::{PluginState,read_config};
+
 use cln_plugin::{Builder, Error, Plugin};
-use std::{path::PathBuf,path::Path};
+
 use anyhow::{anyhow};
-//use cln_rpc::model::{responses,requests}; 
-use cln_rpc::{
-    model::*,
-    primitives::{Amount,AmountOrAny,Sha256},
-    ClnRpc,
-};
 
 use tokio;
-#[tokio::main]
-async fn main() -> Result<(), anyhow::Error> {
-    let state = ();
-
+use tokio::time;
 /*  
-
 The idea is that this plugin works very similar to how the LND addholdinvoce does.
 
 So we have three  commands
@@ -36,30 +30,45 @@ So we have three  commands
     settleinvoice <hash or preimage>
 */
 
-    if let Some(plugin) = Builder::new(tokio::io::stdin(), tokio::io::stdout())
+#[tokio::main] 
+async fn main() -> Result<(), anyhow::Error> {
+    std::env::set_var("CLN_PLUGIN_LOG", "trace");
+
+    
+    let state = PluginState::new();   
+    
+    
+    let plugin = Builder::new(tokio::io::stdin(), tokio::io::stdout())        
         .rpcmethod("addholdinvoice", 
-                   "Call this to create an invoice that will be held until released the preimage", 
-                   hodlmethod)
+        "Call this to create an invoice that will be held until released the preimage", 
+        hodlmethod)
         .rpcmethod("settleinvoice", 
-                   "Call this to released the preimage", 
-                   settlemethod)
+        "Call this to released the preimage", 
+        settlemethod)
         .rpcmethod("cancelinvoice", 
-                   "Call this to cancel the invoice", 
-                   cancelmethod)
-        .hook("htlc_accepted", htlc_accept_handler)
-        .start(state)
+        "Call this to cancel the invoice", 
+        cancelmethod)
+        .rpcmethod("getstatefromstore", 
+        "Call this to get state from store", 
+        getkeyfromstore)
+        .rpcmethod("getdelta", 
+        "Call this to get ctlv-delta value", 
+        getdeltamethod)
+        .hook("htlc_accepted", htlc_accept_handler)        
+        .configure()        
         .await?
-    {
-        plugin.join().await
-    } else {
-        Ok(())
-    }
+        .ok_or_else(|| anyhow!("Error configuring the plugin!"))?;
+
+    read_config(&plugin, state.clone()).await?;
+
+    plugin.start(state).await?.join().await?;
+
+    Ok(())
 }
 
-
 /*  
- TODO: what info do we need to pass into hodlinvoice?
- TODO: what should we do with this information?
+ TO DO: what info do we need to pass into hodlinvoice?
+ TO DO: what should we do with this information?
  nifty guesses: 
      - create an invoice, and remember the preimage/hash 
      
@@ -94,192 +103,104 @@ So we have three  commands
       Answer: With a settlemethod 
 */
 
-/*  
-example: addholdinvoice <amount> <label> <description> <preimage>
-
-description is optional
-preimage is optional
-
-We create a preimage and with the parameters obtained
-we use the cln_rpc library to create an invoice
-
-         invoice <amount> <label> <expiry> <description> <preimage>
-
-         expiry by default 86400 (24 hours) 
-
-We must save the invoice <hash> and its state in the datastore to know
-if the preimage is held or not
-  
-*/
-
-async fn hodlmethod(_p: Plugin<()>, _v: serde_json::Value) -> Result<serde_json::Value, Error> {
-    
-    log::info!("Parametros obtenidos de holdinvoice  {}, plugin config= {}", _v,&_p.configuration().rpc_file);
-
-    if let Some(arr) = _v.as_array() 
-    {        
-        
-        if arr.len()>=2
-        {
-                //let amount_msat;
-                //if _v[0].is_number()
-               // {
-                    let amount_msat_wrap=_v[0].as_u64().unwrap();
-                    let amount_msat=Amount::from_msat(amount_msat_wrap);     
-                //}
-
-                let _label=  _v[1].to_string();
-                let _expiry: u64=3600;                
-                let _description=_v[2].to_string();
-
-                let (pi,hash)= get_preimage_and_hash();                                  
-
-                log::info!("Hash={} Preimage={}", hash,pi);
-
-                let rpc_path: PathBuf= Path::new(&_p.configuration().lightning_dir).join(_p.configuration().rpc_file);
-                let mut rpc = ClnRpc::new(rpc_path).await?;
-               
-                let invoice_request = rpc
-                    .call(Request::Invoice(InvoiceRequest {
-                    amount_msat: AmountOrAny::Amount(amount_msat),
-                    description: _description,
-                    label:_label,
-                    expiry: Some(_expiry),
-                    fallbacks: None,
-                    preimage: Some(pi),
-                    exposeprivatechannels: None,
-                    cltv: Some(50),
-                    deschashonly: None,
-                }))
-                .await
-                .map_err(|e| anyhow!("Error calling invoice: {:?}", e))?;
-                
-                //log::info!("Hash de la preimage {}",hash.to_string());
-
-                //We must get hash and stored it with Preimagestate "held"
-
-                Ok(json!(invoice_request))
-                
-        }
-        else 
-        {            
-            Ok(json!("Faltan parametros"))            
-        }
-         
-    }
-    else 
-    {
-        //log::info!("El valor no es un array");
-        Ok(json!("No ingresaste parametros"))
-    }   
-
-    /* Validate parameters */
-
-    //let _hash: i64 = _v[0].as_i64().unwrap(); 
-    //let _amount: i64 = _v[1].as_i64().unwrap();
-    //let _label = _v[2].as_str().unwrap();    
-    
-    /* Create preimage */
-     
-    /* Save invoice hash  and preimage */
-        
-    
-}
-
-
-/// Example cancelinvoice <hash>
-/// The invoice must be searched with the hash
-/// and Preimagestate must change to "canceled"
-
-
-async fn cancelmethod(_p: Plugin<()>, _v: serde_json::Value) -> Result<serde_json::Value, Error> 
-{
-    let _hash=  _v[0].to_string();
-    //1. Look for invoice hash
-    //2. Change Preimagestate to "canceled"             
-    //Ok(json!("htlc must fail and delete the stored preimage!"))
-    //Ok(json!({"result": "fail","failure_message": "2002"}))
-    Ok(json!({"result": "success"}))
-}
-
-
-/// example: settleinvoice <hash or preimage>
-/// The invoice must be searched with the hash or preimage
-/// and Preimagestate must change to "released"
-
-async fn settlemethod(_p: Plugin<()>, _v: serde_json::Value) -> Result<serde_json::Value, Error> {
-    
-    //1. Look for invoice hash
-    //2. Change Preimagestate to "released"             
-    let _preimage=  _v[0].to_string();
-    //Ok(json!("preimage must be released"))
-    //Ok(json!({"result": "resolve","payment_key": preimage }))
-    Ok(json!({"result": "success"}))
-}
-
 /// We get htlc and look for the hash.
 /// if we have the hash stored with Preimagestate="held" 
 /// We must do to a loop while the preimageState change
-async fn htlc_accept_handler(_p: Plugin<()>,v: serde_json::Value,) -> Result<serde_json::Value, Error> {
-    log::info!("Got a htlc accepted call: {}", v);
 
+pub async fn htlc_accept_handler(plugin: Plugin<PluginState>,v: serde_json::Value,) -> Result<serde_json::Value, Error> 
+{
     if let Some(htlc) = v.get("htlc") 
     {
-        //We get the hash 
-        if let Some(pay_hash) = htlc
-            .get("payment_hash")
-            .and_then(|pay_hash| pay_hash.as_str())
+        if let Some(pay_hash) = htlc.get("payment_hash").and_then(|pay_hash| pay_hash.as_str()) 
         {
-            log::info!("pay_hash: {}", pay_hash.to_string());
-            //We must look for this hash to see if we have it stored
-            //we make it a loop to held the preimage
-            //which we will exit only when the Preimagestate is changed using
-            //the commands settleinvoice, cancelinvoice or until it happens
-            // the expiration time.
-
-            /*             
-            loop 
-            {
+            log::info!("pay_hash obtenido en htlc_accept_handler {}",pay_hash);   
+            let rpc_path: PathBuf= Path::new(&plugin.configuration().lightning_dir).join(plugin.configuration().rpc_file);
+            let mut invoice = None;
+            let cltv_expiry = match htlc.get("cltv_expiry") 
+            {                
+                Some(ce) => 
+                {                
+                    log::info!("cltv_expiry en htlc = {}",ce);    
+                    ce.as_u64().unwrap()
+                }
+                None => return Err(anyhow!("expiry not found! payment_hash: {}", pay_hash)),
+            };
+            loop {
+                log::info!("Entrando al ciclo");   
+                let preimagestate = match listdatastore(&rpc_path, Some(vec![PLUGIN_NAME.to_string(), pay_hash.to_string()])).await 
                 {
-                    match preimagestate 
+                    Ok(resp) => {
+                        if resp.datastore.len()== 1 
+                        {
+                            log::info!("Obtuvimos un resultado de datastore y vamos a buscar el invoice de ese pay_hash");   
+
+                            if invoice.is_none() 
+                            {
+                                invoice = Some(listinvoices(&rpc_path, None, Some(pay_hash.to_string()))
+                                    .await?
+                                    .invoices
+                                    .first()
+                                    .ok_or(anyhow!("invoice not found"))?
+                                    .clone());
+                            }
+                            let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                            log::info!("unix epoch en segundos {}",now);   
+
+                            if invoice.as_ref().unwrap().expires_at <= now 
+                            {
+                                warn!("hodling invoice with payment_hash: {} expired, rejecting!", pay_hash);
+                                log::info!("hodling invoice with payment_hash: {} expired, rejecting!", pay_hash);   
+                                return Ok(json!({"result": "fail"}));
+                            }
+                            let cltv_delta = plugin.state().cltv_delta.lock().clone() as u64;
+                            let block_height=plugin.state().blockheight.lock().clone();
+
+                            log::info!("cltv_delta= {} block_height = {}", cltv_delta,block_height);   
+
+                            if cltv_expiry - cltv_delta <= block_height + CLTV_HODL as u64 
+                            {
+                                warn!("htlc timed out for payment_hash: {}, rejecting!", pay_hash);
+                                return Ok(json!({"result": "fail"}));
+                            }
+                            Preimagestate::from_str(resp.datastore.first().unwrap().string.as_ref().unwrap()).unwrap()
+
+                        } 
+                        else 
+                        {
+                            log::info!("Obtuvimos cero o mas de un resultado de datastore");   
+                            return Err(anyhow!("wrong amount of results found for payment_hash: {} {:?}",
+                                pay_hash, resp.datastore));
+
+                        }
+                    },
+                    Err(e) => 
                     {
-                        Preimagestate::Held => {
-                            debug!("invoice with preimage held payment_hash: {}", pay_hash);
-                        }
-                        Preimagestate::Released => {
-                            debug!("invoice with preimage released payment_hash: {}", pay_hash);
-                            return Ok(json!({"result": "continue"}));
-                        }
-                        Preimagestate::Canceled => {
-                            debug!("invoice canceled with payment_hash: {}", pay_hash);
-                            return Ok(json!({"result": "fail"}));
-                        }
+                        debug!("{} not our invoice: payment_hash: {}", e.to_string(), pay_hash);
+                        log::info!("payment_hash: {}  not our invoice: {}",  pay_hash,e.to_string());   
+                        return Ok(json!({"result": "continue"}));
+                    }
+                };
+                match preimagestate 
+                {
+                    Preimagestate::Held => {
+                        debug!("hodling invoice with payment_hash: {}", pay_hash);
+                        log::info!("Preimage held, hodling invoice with payment_hash: {}", pay_hash);                           
+                    }
+                    Preimagestate::Released => {
+                        debug!("accepted invoice with payment_hash: {}", pay_hash);
+                        log::info!("Preimage released, accepted invoice with payment_hash: {}", pay_hash);   
+                        return Ok(json!({"result": "continue"}));
+                    }
+                    Preimagestate::Rejected => {
+                        debug!("rejected invoice with payment_hash: {}", pay_hash);
+                        log::info!("Preimage rejected, rejected invoice with payment_hash: {}", pay_hash);   
+                        return Ok(json!({"result": "fail"}));
                     }
                 }
+                log::info!("Sleeping 3 sgs");   
                 time::sleep(Duration::from_secs(3)).await;
             }
-            */
-
         }
     }
-        
-    Ok(json!({"result": "continue"}))        
-
-}
-
-/// Function to create a tuple with preimage and hash  
-
-fn get_preimage_and_hash() -> (String,Sha256) 
-{
-    let mut preimage = [0u8; 32];
-    thread_rng().fill(&mut preimage[..]);
-
-    let preimage_str = serialize_hex(&preimage);
-
-    let mut hash = Sha256::engine();
-    hash.input(&preimage);
-    let payment_hash = Sha256::from_engine(hash);
-    
-    (preimage_str, payment_hash)
-
+    Ok(json!({"result": "continue"}))
 }
