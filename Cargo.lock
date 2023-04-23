@@ -513,9 +513,11 @@ dependencies = [
  "bitcoin",
  "cln-plugin",
  "cln-rpc",
+ "hex",
  "log",
  "parking_lot",
  "rand",
+ "regex",
  "serde_json",
  "tokio",
 ]

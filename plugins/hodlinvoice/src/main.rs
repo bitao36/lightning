@@ -12,7 +12,7 @@ use log::{debug, warn};
 mod config;
 mod model;
 
-use model::{Preimagestate,hodlmethod,settlemethod,cancelmethod,listdatastore, listinvoices,getkeyfromstore,getdeltamethod,PLUGIN_NAME,CLTV_HODL};
+use model::{Preimagestate,hodlmethod,settlemethod,cancelmethod,listdatastore, listinvoices,getkeyfromstore,getdeltamethod,getblockheight,getblockheightmethod,PLUGIN_NAME,CLTV_HODL};
 use config::{PluginState,read_config};
 
 use cln_plugin::{Builder, Error, Plugin};
@@ -54,10 +54,15 @@ async fn main() -> Result<(), anyhow::Error> {
         .rpcmethod("getdelta", 
         "Call this to get ctlv-delta value", 
         getdeltamethod)
+        .rpcmethod("getblockheight", 
+        "Call this to get ctlv-delta value", 
+        getblockheightmethod)
         .hook("htlc_accepted", htlc_accept_handler)        
         .configure()        
         .await?
         .ok_or_else(|| anyhow!("Error configuring the plugin!"))?;
+    
+    
 
     read_config(&plugin, state.clone()).await?;
 
@@ -120,7 +125,7 @@ pub async fn htlc_accept_handler(plugin: Plugin<PluginState>,v: serde_json::Valu
             {                
                 Some(ce) => 
                 {                
-                    log::info!("cltv_expiry en htlc = {}",ce);    
+                    debug!("cltv_expiry en htlc = {}",ce);    
                     ce.as_u64().unwrap()
                 }
                 None => return Err(anyhow!("expiry not found! payment_hash: {}", pay_hash)),
@@ -132,7 +137,7 @@ pub async fn htlc_accept_handler(plugin: Plugin<PluginState>,v: serde_json::Valu
                     Ok(resp) => {
                         if resp.datastore.len()== 1 
                         {
-                            log::info!("Obtuvimos un resultado de datastore y vamos a buscar el invoice de ese pay_hash");   
+                            debug!("Obtuvimos un resultado de datastore y vamos a buscar el invoice de ese pay_hash");   
 
                             if invoice.is_none() 
                             {
@@ -144,22 +149,24 @@ pub async fn htlc_accept_handler(plugin: Plugin<PluginState>,v: serde_json::Valu
                                     .clone());
                             }
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                            log::info!("unix epoch en segundos {}",now);   
+                            debug!("unix epoch en segundos {}",now);   
 
                             if invoice.as_ref().unwrap().expires_at <= now 
                             {
                                 warn!("hodling invoice with payment_hash: {} expired, rejecting!", pay_hash);
-                                log::info!("hodling invoice with payment_hash: {} expired, rejecting!", pay_hash);   
+                                debug!("hodling invoice with payment_hash: {} expired, rejecting!", pay_hash);   
                                 return Ok(json!({"result": "fail"}));
                             }
                             let cltv_delta = plugin.state().cltv_delta.lock().clone() as u64;
-                            let block_height=plugin.state().blockheight.lock().clone();
-
-                            log::info!("cltv_delta= {} block_height = {}", cltv_delta,block_height);   
+                            //let block_height=plugin.state().blockheight.lock().clone();
+                            let block_height = getblockheight(&rpc_path).await.unwrap_or(0) as u64;
+                            
+                            debug!("cltv_delta= {} block_height = {}", cltv_delta,block_height);   
 
                             if cltv_expiry - cltv_delta <= block_height + CLTV_HODL as u64 
                             {
                                 warn!("htlc timed out for payment_hash: {}, rejecting!", pay_hash);
+                                debug!("htlc timed out for payment_hash: {}, rejecting!", pay_hash);
                                 return Ok(json!({"result": "fail"}));
                             }
                             Preimagestate::from_str(resp.datastore.first().unwrap().string.as_ref().unwrap()).unwrap()
@@ -167,37 +174,35 @@ pub async fn htlc_accept_handler(plugin: Plugin<PluginState>,v: serde_json::Valu
                         } 
                         else 
                         {
-                            log::info!("Obtuvimos cero o mas de un resultado de datastore");   
-                            return Err(anyhow!("wrong amount of results found for payment_hash: {} {:?}",
-                                pay_hash, resp.datastore));
+                            debug!("Payment hash={} Obtuvimos cero o mas de un resultado de datastore={:?}",pay_hash, resp.datastore);   
+                            //return Err(anyhow!("wrong amount of results found for payment_hash: {} {:?}",
+                              //  pay_hash, resp.datastore));
+                            return Ok(json!({"result": "continue"}));    
 
                         }
                     },
                     Err(e) => 
                     {
-                        debug!("{} not our invoice: payment_hash: {}", e.to_string(), pay_hash);
-                        log::info!("payment_hash: {}  not our invoice: {}",  pay_hash,e.to_string());   
+                        debug!("payment_hash: {}  not our invoice: {}",  pay_hash,e.to_string());
+                        //log::info!("payment_hash: {}  not our invoice: {}",  pay_hash,e.to_string());   
                         return Ok(json!({"result": "continue"}));
                     }
                 };
                 match preimagestate 
                 {
-                    Preimagestate::Held => {
-                        debug!("hodling invoice with payment_hash: {}", pay_hash);
-                        log::info!("Preimage held, hodling invoice with payment_hash: {}", pay_hash);                           
+                    Preimagestate::Held => {                        
+                        debug!("Preimage held, hodling invoice with payment_hash: {}", pay_hash);                           
                     }
-                    Preimagestate::Released => {
-                        debug!("accepted invoice with payment_hash: {}", pay_hash);
-                        log::info!("Preimage released, accepted invoice with payment_hash: {}", pay_hash);   
+                    Preimagestate::Released => {                        
+                        debug!("Preimage released, accepted invoice with payment_hash: {}", pay_hash);   
                         return Ok(json!({"result": "continue"}));
                     }
-                    Preimagestate::Rejected => {
-                        debug!("rejected invoice with payment_hash: {}", pay_hash);
-                        log::info!("Preimage rejected, rejected invoice with payment_hash: {}", pay_hash);   
+                    Preimagestate::Rejected => {                        
+                        debug!("Preimage rejected, rejected invoice with payment_hash: {}", pay_hash);   
                         return Ok(json!({"result": "fail"}));
                     }
                 }
-                log::info!("Sleeping 3 sgs");   
+                debug!("Sleeping 3 sgs");   
                 time::sleep(Duration::from_secs(3)).await;
             }
         }
